@@ -10,6 +10,10 @@ from pathlib import Path
 from typing import List, Generator, Optional
 
 import tes
+import json
+from requests_oauthlib import OAuth2Session
+import requests
+
 
 from snakemake_interface_executor_plugins.executors.base import SubmittedJobInfo
 from snakemake_interface_executor_plugins.executors.remote import RemoteExecutor
@@ -58,6 +62,35 @@ class ExecutorSettings(ExecutorSettingsBase):
         },
     )
 
+    oidc_client_id: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "OIDC client ID",
+            "env_var": True,
+        },
+    )
+    oidc_client_secret: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "OIDC client secret",
+            "env_var": True,
+        },
+    )
+    oidc_url: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "OIDC URL",
+            "env_var": True,
+        },
+    )
+    oidc_refresh_token: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "OIDC refresh token",
+            "env_var": True,
+        },
+    )
+
 
 # Required:
 # Specify common settings shared by various executors.
@@ -89,9 +122,14 @@ class Executor(RemoteExecutor):
         self.container_workdir = Path("/tmp")
         self.tes_url = self.workflow.executor_settings.url
 
+        self.session = OAuth2Session()
+
+        self.refresh_token = None
+        self.access_token = None
+
         self.tes_client = tes.HTTPClient(
             url=self.tes_url,
-            token=self.workflow.executor_settings.token,
+            token=self.access_token or self.workflow.executor_settings.token,
             user=self.workflow.executor_settings.user,
             password=self.workflow.executor_settings.password,
         )
@@ -112,6 +150,7 @@ class Executor(RemoteExecutor):
         # submit job here, and obtain job ids from the backend
         try:
             task = self._get_task(job, jobscript)
+            self.tes_client.token = self._get_access_token()
             tes_id = self.tes_client.create_task(task)
             self.logger.info(f"[TES] Task submitted: {tes_id}")
         except Exception as e:
@@ -151,6 +190,7 @@ class Executor(RemoteExecutor):
 
         for j in active_jobs:
             async with self.status_rate_limiter:
+                self.tes_client.token = self._get_access_token()
                 res = self.tes_client.get_task(j.external_jobid, view="MINIMAL")
                 self.logger.debug(
                     "[TES] State of task '{id}': {state}".format(
@@ -176,6 +216,7 @@ class Executor(RemoteExecutor):
         # This method is called when Snakemake is interrupted.
         for job_info in active_jobs:
             try:
+                self.tes_client.token = self._get_access_token()
                 self.tes_client.cancel_task(job_info.external_jobid)
                 self.logger.info(f"[TES] Task canceled: {job_info.external_jobid}")
             except Exception:
@@ -346,3 +387,65 @@ class Executor(RemoteExecutor):
         tes_task = tes.Task(**task)
         self.logger.debug(f"[TES] Built task: {tes_task}")
         return tes_task
+    
+    def _refresh_token(self):
+        self._load_tokens() 
+        refresh_token = self.refresh_token or self.workflow.executor_settings.oidc_refresh_token
+
+        new_tokens = self.session.refresh_token(
+            self.workflow.executor_settings.oidc_url + "/token",
+            refresh_token=refresh_token,
+            client_id=self.workflow.executor_settings.oidc_client_id,
+            client_secret=self.workflow.executor_settings.oidc_client_secret,
+        )
+
+        self.access_token = new_tokens["access_token"]
+        self.refresh_token = new_tokens["refresh_token"]
+
+        self._save_tokens()
+    
+    def _save_tokens(self):
+        with open(".oidc_tokens.json", "w") as f:
+            tokens = {
+                "access_token": self.access_token,
+                "refresh_token": self.refresh_token,
+            }
+
+            json.dump(tokens, f)
+
+    def _load_tokens(self):
+        try:
+            with open(".oidc_tokens.json", "r") as f:
+                tokens = json.load(f)
+                self.access_token = tokens["access_token"]
+                self.refresh_token = tokens["refresh_token"]
+        except FileNotFoundError:
+            self.access_token = None
+            self.refresh_token = None
+    
+    def _validate_access_token(self, access_token):
+        token_info_url = self.workflow.executor_settings.oidc_url + f"/introspect?token={access_token}"
+        auth = requests.auth.HTTPBasicAuth(self.workflow.executor_settings.oidc_client_id, self.workflow.executor_settings.oidc_client_secret)
+        token_info_response = requests.get(token_info_url, auth=auth)
+
+        if token_info_response.status_code != 200:
+            return False
+
+        token_info = token_info_response.json()
+
+        if token_info["active"]:
+            return True
+        
+        return False
+
+    def _get_access_token(self):
+        if self.access_token is None:
+            self.access_token = self.workflow.executor_settings.token
+
+        if self.access_token is None:
+            self._load_tokens()
+
+        if self.access_token is None or not self._validate_access_token(self.access_token):
+            self._refresh_token()
+        
+        return self.access_token
