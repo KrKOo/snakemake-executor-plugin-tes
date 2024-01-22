@@ -19,6 +19,7 @@ python = "^3.11"
 snakemake-interface-common = "^1.14.0"
 snakemake-interface-executor-plugins = "^8.1.1"
 py-tes = "^0.4.2"
+requests = "^2.26.0"
 
 
 [tool.poetry.group.dev.dependencies]
