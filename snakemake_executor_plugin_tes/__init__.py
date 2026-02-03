@@ -8,7 +8,6 @@ import math
 import os
 from pathlib import Path
 from typing import List, Generator, Optional
-
 import tes
 
 from snakemake_interface_executor_plugins.executors.base import SubmittedJobInfo
@@ -21,6 +20,7 @@ from snakemake_interface_executor_plugins.jobs import (
     JobExecutorInterface,
 )
 from snakemake_interface_common.exceptions import WorkflowError
+from oidc_auth_plugin import AuthService
 
 
 # Optional:
@@ -53,7 +53,14 @@ class ExecutorSettings(ExecutorSettingsBase):
     token: Optional[str] = field(
         default=None,
         metadata={
-            "help": "TES token (either specify this or a user/password)",
+            "help": "TES token (either specify this or user/password)",
+            "env_var": True,
+        },
+    )
+    oidc_auth: Optional[bool] = field(
+        default=False,
+        metadata={
+            "help": "Use OIDC authentication",
             "env_var": True,
         },
     )
@@ -89,12 +96,32 @@ class Executor(RemoteExecutor):
         self.container_workdir = Path("/tmp")
         self.tes_url = self.workflow.executor_settings.url
 
+        if self.workflow.executor_settings.oidc_auth:
+            self.auth_service = AuthService(
+                self.workflow.executor_settings.token,
+                os.environ["CLIENT_ID"],
+                os.environ["CLIENT_SECRET"],
+                os.environ["OIDC_URL"],
+                os.environ["AUDIENCE"],
+                do_dynreg=os.environ.get("SNAKEMAKE_MASTER", "false").lower() == "true",
+            )
+
         self.tes_client = tes.HTTPClient(
             url=self.tes_url,
-            token=self.workflow.executor_settings.token,
+            token=self.tes_access_token,
             user=self.workflow.executor_settings.user,
             password=self.workflow.executor_settings.password,
         )
+
+    @property
+    def tes_access_token(self):
+        if not self.workflow.executor_settings.oidc_auth:
+            return self.workflow.executor_settings.token
+
+        if not self.auth_service:
+            return None
+
+        return self.auth_service.access_token
 
     def run_job(self, job: JobExecutorInterface):
         # Implement here how to run a job.
@@ -112,6 +139,13 @@ class Executor(RemoteExecutor):
         # submit job here, and obtain job ids from the backend
         try:
             task = self._get_task(job, jobscript)
+            # Refresh now to be sure, that the token is not going to be
+            # refreshed before the tasks starts running.
+            if self.auth_service:
+                self.auth_service.refresh_token_if_near_expiry()
+
+            self.tes_client.token = self.tes_access_token
+
             tes_id = self.tes_client.create_task(task)
             self.logger.info(f"[TES] Task submitted: {tes_id}")
         except Exception as e:
@@ -149,8 +183,10 @@ class Executor(RemoteExecutor):
             "CANCELED",  # TODO: really call `error_callback` on this?
         ]
 
+        finished_job_count = 0
         for j in active_jobs:
             async with self.status_rate_limiter:
+                self.tes_client.token = self.tes_access_token
                 res = self.tes_client.get_task(j.external_jobid, view="MINIMAL")
                 self.logger.debug(
                     "[TES] State of task '{id}': {state}".format(
@@ -159,14 +195,10 @@ class Executor(RemoteExecutor):
                 )
                 if res.state in UNFINISHED_STATES:
                     yield j
-                elif res.state in ERROR_STATES:
-                    # TODO remove this dbg code
-                    import sys
+                else:
+                    finished_job_count += 1
 
-                    print(
-                        open(os.environ["GITHUB_WORKSPACE"] + "/funnel.log").read(),
-                        file=sys.stderr,
-                    )
+                if res.state in ERROR_STATES:
                     self.report_job_error(j)
                 elif res.state == "COMPLETE":
                     self.report_job_success(j)
@@ -176,6 +208,7 @@ class Executor(RemoteExecutor):
         # This method is called when Snakemake is interrupted.
         for job_info in active_jobs:
             try:
+                self.tes_client.token = self.tes_access_token
                 self.tes_client.cancel_task(job_info.external_jobid)
                 self.logger.info(f"[TES] Task canceled: {job_info.external_jobid}")
             except Exception:
@@ -211,11 +244,11 @@ class Executor(RemoteExecutor):
         overwrite_path=None,
         checkdir=None,
         pass_content=False,
-        type="Input",
+        filetype="Input",
     ):
         # TODO: handle FTP files
         max_file_size = 131072
-        if type not in ["Input", "Output"]:
+        if filetype not in ["Input", "Output"]:
             raise ValueError("Value for 'model' has to be either 'Input' or 'Output'.")
 
         members = {}
@@ -223,6 +256,17 @@ class Executor(RemoteExecutor):
         # Handle remote files
         if hasattr(iofile, "is_storage") and iofile.is_storage:
             return None
+
+        elif hasattr(iofile, "is_passthrough") and iofile.is_passthrough:
+            if iofile.passthrough_path.startswith("htsget://"):
+                members["url"] = iofile.passthrough_path.replace(
+                    "htsget://", "htsget://bearer:" + self.tes_access_token + "@"
+                )
+            else:
+                members["url"] = iofile.passthrough_path
+
+            members["path"] = self._get_members_path(overwrite_path, iofile)
+            members["content"] = None
 
         # Handle local files
         else:
@@ -247,7 +291,7 @@ class Executor(RemoteExecutor):
                         members["content"] = stream.read()
                     members["url"] = None
 
-        model = getattr(tes.models, type)
+        model = getattr(tes.models, filetype)
         self.logger.warning(members)
         return model(**members)
 
@@ -286,7 +330,7 @@ class Executor(RemoteExecutor):
 
     def _append_task_outputs(self, outputs, files, checkdir):
         for file in files:
-            obj = self._prepare_file(iofile=file, checkdir=checkdir, type="Output")
+            obj = self._prepare_file(iofile=file, checkdir=checkdir, filetype="Output")
             if obj:
                 outputs.append(obj)
         return outputs
