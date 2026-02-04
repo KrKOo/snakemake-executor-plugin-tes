@@ -95,7 +95,7 @@ class Executor(RemoteExecutor):
     def __post_init__(self):
         self.container_workdir = Path("/tmp")
         self.tes_url = self.workflow.executor_settings.url
-
+        self.auth_service = None
         if self.workflow.executor_settings.oidc_auth:
             self.auth_service = AuthService(
                 self.workflow.executor_settings.token,
@@ -292,7 +292,7 @@ class Executor(RemoteExecutor):
                     members["url"] = None
 
         model = getattr(tes.models, filetype)
-        self.logger.warning(members)
+        self.logger.warning(str(members))
         return model(**members)
 
     def _get_task_description(self, job: JobExecutorInterface):
