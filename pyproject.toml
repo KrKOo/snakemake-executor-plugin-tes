@@ -19,7 +19,7 @@ python = "^3.11"
 snakemake-interface-common = "^1.14.0"
 snakemake-interface-executor-plugins = "^9.0.0"
 py-tes = "^0.4.2"
-
+oidc-auth-plugin = { git = "https://github.com/KrKOo/snakemake-auth-plugins", branch = "main", subdirectory = "oidc-auth-plugin" }
 
 [tool.poetry.group.dev.dependencies]
 black = "^23.9.1"
@@ -27,8 +27,6 @@ flake8 = "^6.1.0"
 coverage = "^7.3.1"
 pytest = "^7.4.2"
 snakemake = "^8.20.1"
-snakemake-storage-plugin-s3 = "^0.2.7"
-oidc-auth-plugin = { git = "https://github.com/KrKOo/snakemake-auth-plugins", branch = "main", subdirectory = "oidc-auth-plugin" }
 
 
 [tool.coverage.run]
