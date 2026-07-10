@@ -225,11 +225,7 @@ class Executor(RemoteExecutor):
             return None
 
         elif hasattr(iofile, "is_passthrough") and iofile.is_passthrough:
-            if iofile.passthrough_path.startswith("htsget://"):
-                members["url"] = iofile.passthrough_path.replace("htsget://", "htsget://bearer:" + self._get_access_token() + "@")
-            else:
-                members["url"] = iofile.passthrough_path
-
+            members["url"] = iofile.passthrough_path
             members["path"] = self._get_members_path(overwrite_path, iofile)
             members["content"] = None
 
